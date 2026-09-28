@@ -1,0 +1,45 @@
+# MFL AI Security Lab
+# Author: @freyley.leyva
+services:
+  api:
+    build: ./app
+    ports: ["8000:8000"]
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      OLLAMA_BASE_URL: http://ollama:11434
+      MODEL: qwen2.5:1.5b
+      EMBED_MODEL: nomic-embed-text
+    volumes:
+      - ./documents:/lab/documents:ro
+      - ./evidence:/lab/evidence
+    depends_on: [qdrant, ollama]
+
+  frontend:
+    build: ./frontend
+    ports: ["8501:8501"]
+    environment:
+      API_URL: http://api:8000
+    depends_on: [api]
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports: ["6333:6333"]
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes:
+      - ollama_data:/root/.ollama
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+
+volumes:
+  qdrant_data:
+  ollama_data:
