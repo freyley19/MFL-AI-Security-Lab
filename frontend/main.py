@@ -2,6 +2,7 @@
 # Author: @freyley.leyva
 
 import os
+import re
 import requests
 import streamlit as st
 
@@ -41,6 +42,43 @@ USERS = {
         "role": "admin"
     }
 }
+
+
+# =========================================================
+# DETECCIÓN SIMPLE DE ACCIONES DEL LABORATORIO
+# =========================================================
+
+def parse_transfer(question: str):
+    """
+    Reconoce órdenes simples como:
+
+    Transfiere $5000 desde MFL-002 a MFL-001
+    """
+
+    pattern = (
+        r"transfiere\s+\$?([\d,]+(?:\.\d{1,2})?)"
+        r"\s+desde\s+(MFL-\d+)"
+        r"\s+(?:a|hacia)\s+(MFL-\d+)"
+    )
+
+    match = re.search(
+        pattern,
+        question,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return None
+
+    amount = float(
+        match.group(1).replace(",", "")
+    )
+
+    return {
+        "amount": amount,
+        "from_account": match.group(2).upper(),
+        "to_account": match.group(3).upper()
+    }
 
 
 # =========================================================
@@ -150,47 +188,122 @@ with col_chat:
             st.markdown(question)
 
         # -------------------------------------------------
-        # Por ahora conservamos compatibilidad con API v0.1
+        # Detectamos si la entrada corresponde a una acción
+        # o a una pregunta para el RAG
         # -------------------------------------------------
 
         try:
 
-            with st.spinner("MFL Assistant está pensando..."):
+            transfer = parse_transfer(question)
 
-                response = requests.post(
-                    f"{API}/ask",
-                    json={
-                        "question": question,
-                        "user_id": user["user_id"],
-                        "role": user["role"],
-                        "secure_mode": secure
-                    },
-                    timeout=240
+            # =============================================
+            # ACCIÓN / TOOL
+            # =============================================
+
+            if transfer:
+
+                with st.spinner(
+                    "MFL Assistant está procesando la acción..."
+                ):
+
+                    response = requests.post(
+                        f"{API}/transfer",
+                        json={
+                            "from_account": transfer["from_account"],
+                            "to_account": transfer["to_account"],
+                            "amount": transfer["amount"],
+                            "user_id": user["user_id"],
+                            "role": user["role"],
+                            "secure_mode": secure
+                        },
+                        timeout=30
+                    )
+
+                    response.raise_for_status()
+                    data = response.json()
+
+                if data["decision"] == "allow":
+
+                    answer = (
+                        f"💸 **Acción ejecutada en simulación**\n\n"
+                        f"Origen: `{transfer['from_account']}`  \n"
+                        f"Destino: `{transfer['to_account']}`  \n"
+                        f"Monto: `${transfer['amount']:,.2f} MXN`  \n\n"
+                        f"✅ **ALLOW**"
+                    )
+
+                else:
+
+                    answer = (
+                        f"🛡️ **Acción bloqueada**\n\n"
+                        f"Origen: `{transfer['from_account']}`  \n"
+                        f"Destino: `{transfer['to_account']}`  \n"
+                        f"Monto: `${transfer['amount']:,.2f} MXN`  \n\n"
+                        f"🚫 **DENY**  \n"
+                        f"Motivo: {data['reason']}"
+                    )
+
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer
+                    }
                 )
 
-                response.raise_for_status()
+                with st.chat_message("assistant"):
 
-                data = response.json()
+                    st.markdown(answer)
 
-                answer = data["answer"]
+                    st.caption(
+                        f"request_id: {data['request_id']} "
+                        f"· tool: transfer_money"
+                    )
 
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": answer
-                }
-            )
+            # =============================================
+            # PREGUNTA / RAG
+            # =============================================
 
-            with st.chat_message("assistant"):
+            else:
 
-                st.markdown(answer)
+                with st.spinner(
+                    "MFL Assistant está pensando..."
+                ):
 
-                st.caption(
-                    f"request_id: {data['request_id']}"
+                    response = requests.post(
+                        f"{API}/ask",
+                        json={
+                            "question": question,
+                            "user_id": user["user_id"],
+                            "role": user["role"],
+                            "secure_mode": secure
+                        },
+                        timeout=240
+                    )
+
+                    response.raise_for_status()
+
+                    data = response.json()
+                    answer = data["answer"]
+
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer
+                    }
                 )
 
-                with st.expander("📚 Fuentes recuperadas"):
-                    st.json(data["sources"])
+                with st.chat_message("assistant"):
+
+                    st.markdown(answer)
+
+                    st.caption(
+                        f"request_id: {data['request_id']}"
+                    )
+
+                    with st.expander(
+                        "📚 Fuentes recuperadas"
+                    ):
+                        st.json(data["sources"])
 
         except requests.exceptions.Timeout:
 
@@ -262,9 +375,13 @@ role = {user["role"]}"""
 
             response.raise_for_status()
 
-            st.success("Knowledge Base actualizada.")
+            st.success(
+                "Knowledge Base actualizada."
+            )
 
-            st.json(response.json())
+            st.json(
+                response.json()
+            )
 
         except requests.exceptions.RequestException as exc:
 

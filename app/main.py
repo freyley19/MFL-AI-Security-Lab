@@ -147,6 +147,76 @@ def warmup():
             detail="Ollama no está disponible."
         )
 
+# =========================================================
+# TOOL FICTICIO — TRANSFERENCIAS
+# =========================================================
+
+class TransferRequest(BaseModel):
+    from_account: str
+    to_account: str
+    amount: float
+    user_id: str
+    role: Literal["customer", "support", "admin"] = "customer"
+    secure_mode: bool = False
+
+
+@app.post("/transfer")
+def transfer(req: TransferRequest):
+    request_id = str(uuid.uuid4())[:8]
+
+    # -----------------------------------------------------
+    # VULNERABLE:
+    # confiamos en los parámetros recibidos.
+    # -----------------------------------------------------
+    if not req.secure_mode:
+        decision = "allow"
+        reason = "Vulnerable mode: no tool authorization"
+
+    # -----------------------------------------------------
+    # HARDENED:
+    # un customer solo puede transferir desde su cuenta.
+    # -----------------------------------------------------
+    else:
+        if req.role == "customer" and req.from_account != req.user_id:
+            decision = "deny"
+            reason = "Customer does not own source account"
+        else:
+            decision = "allow"
+            reason = "Tool authorization passed"
+
+    event = {
+        "request_id": request_id,
+        "event_type": "transfer",
+        "user_id": req.user_id,
+        "role": req.role,
+        "secure_mode": req.secure_mode,
+        "from_account": req.from_account,
+        "to_account": req.to_account,
+        "amount": req.amount,
+        "decision": decision,
+        "reason": reason
+    }
+
+    log_event(event)
+
+    if decision == "deny":
+        return {
+            "request_id": request_id,
+            "status": "blocked",
+            "decision": decision,
+            "reason": reason
+        }
+
+    return {
+        "request_id": request_id,
+        "status": "simulated",
+        "decision": decision,
+        "message": (
+            f"Transferencia simulada de ${req.amount:,.2f} MXN "
+            f"desde {req.from_account} hacia {req.to_account}."
+        )
+    }
+
 
 # @freyley.leyva
 @app.post("/ask")
