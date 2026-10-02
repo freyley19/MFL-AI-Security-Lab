@@ -22,8 +22,8 @@ q=QdrantClient(url=QDRANT_URL)
 
 class Ask(BaseModel):
     question: str
-    role: Literal["guest","support","admin"]="guest"
-    secure_mode: bool=False
+    role: Literal["customer", "support", "admin"] = "customer"
+    secure_mode: bool = False
 
 def embed(text:str):
     r=requests.post(f"{OLLAMA}/api/embeddings",json={"model":EMBED_MODEL,"prompt":text},timeout=120)
