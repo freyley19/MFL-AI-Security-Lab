@@ -7,7 +7,15 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchAny
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchAny,
+    MatchValue
+)
 
 app = FastAPI(title="MFL AI Security Lab", version="0.1.0")
 QDRANT_URL=os.getenv("QDRANT_URL","http://qdrant:6333")
@@ -22,6 +30,7 @@ q=QdrantClient(url=QDRANT_URL)
 
 class Ask(BaseModel):
     question: str
+    user_id: str = "MFL-001"
     role: Literal["customer", "support", "admin"] = "customer"
     secure_mode: bool = False
 
@@ -29,11 +38,16 @@ def embed(text:str):
     r=requests.post(f"{OLLAMA}/api/embeddings",json={"model":EMBED_MODEL,"prompt":text},timeout=120)
     r.raise_for_status(); return r.json()["embedding"]
 
-def meta(text:str):
-    classification=re.search(r"classification:\s*(\w+)",text)
-    roles=re.search(r"roles:\s*([^\n]+)",text)
-    return (classification.group(1) if classification else "public",
-            [x.strip() for x in roles.group(1).split(",")] if roles else ["all"])
+def meta(text: str):
+    classification = re.search(r"classification:\s*(\w+)", text)
+    roles = re.search(r"roles:\s*([^\n]+)", text)
+    owner_id = re.search(r"owner_id:\s*([^\s]+)", text)
+
+    return (
+        classification.group(1) if classification else "public",
+        [x.strip() for x in roles.group(1).split(",")] if roles else ["all"],
+        owner_id.group(1) if owner_id else None
+    )
 
 def log_event(event:dict):
     with (EVIDENCE/"audit.jsonl").open("a",encoding="utf-8") as f: f.write(json.dumps(event,ensure_ascii=False)+"\n")
@@ -43,19 +57,60 @@ def health(): return {"status":"ok","lab":"MFL","author":"@freyley.leyva"}
 
 @app.post("/ingest")
 def ingest():
-    files=list(DOCS.glob("*.md"))
-    if not files: raise HTTPException(404,"No documents found")
-    first=embed("dimension probe")
-    try: q.delete_collection(COLLECTION)
-    except Exception: pass
-    q.create_collection(COLLECTION,vectors_config=VectorParams(size=len(first),distance=Distance.COSINE))
-    points=[]
-    for i,p in enumerate(files):
-        text=p.read_text(encoding="utf-8")
-        classification,roles=meta(text)
-        points.append(PointStruct(id=i+1,vector=embed(text),payload={"source":p.name,"text":text,"classification":classification,"roles":roles}))
-    q.upsert(COLLECTION,points=points)
-    return {"status":"ok","documents":len(points),"collection":COLLECTION}
+    files = sorted(DOCS.rglob("*.md"))
+
+    if not files:
+        raise HTTPException(404, "No documents found")
+
+    first = embed("dimension probe")
+
+    try:
+        q.delete_collection(COLLECTION)
+    except Exception:
+        pass
+
+    q.create_collection(
+        COLLECTION,
+        vectors_config=VectorParams(
+            size=len(first),
+            distance=Distance.COSINE
+        )
+    )
+
+    points = []
+
+    for i, p in enumerate(files):
+        text = p.read_text(encoding="utf-8")
+        classification, roles, owner_id = meta(text)
+
+        payload = {
+            "source": str(p.relative_to(DOCS)),
+            "text": text,
+            "classification": classification,
+            "roles": roles
+        }
+
+        if owner_id:
+            payload["owner_id"] = owner_id
+
+        points.append(
+            PointStruct(
+                id=i + 1,
+                vector=embed(text),
+                payload=payload
+            )
+        )
+
+    q.upsert(
+        collection_name=COLLECTION,
+        points=points
+    )
+
+    return {
+        "status": "ok",
+        "documents": len(points),
+        "collection": COLLECTION
+    }
 
 # @freyley.leyva
 @app.post("/warmup")
@@ -102,32 +157,62 @@ def ask(req: Ask):
     query = embed(req.question)
 
     # 2. En modo seguro aplicamos control de acceso por rol
+    # 2. En modo seguro aplicamos autorización antes del LLM
     filt = None
+
     if req.secure_mode:
-        filt = Filter(
-            should=[
-                FieldCondition(
-                    key="roles",
-                    match=MatchAny(any=["all", req.role])
-                )
-            ]
+
+        # CUSTOMER:
+        # Puede recuperar documentos públicos ("all")
+        # o recursos customer que además le pertenezcan.
+        if req.role == "customer":
+            filt = Filter(
+                should=[
+                    FieldCondition(
+                        key="roles",
+                        match=MatchAny(any=["all"])
+                    ),
+                    Filter(
+                        must=[
+                            FieldCondition(
+                                key="roles",
+                                match=MatchAny(any=["customer"])
+                            ),
+                            FieldCondition(
+                                key="owner_id",
+                                match=MatchValue(value=req.user_id)
+                            )
+                        ]
+                    )
+                ]
+            )
+
+        # SUPPORT / ADMIN:
+        # Conservamos por ahora la política basada en rol.
+        else:
+            filt = Filter(
+                should=[
+                    FieldCondition(
+                        key="roles",
+                        match=MatchAny(any=["all", req.role])
+                    )
+                ]
+            )
+        # 3. Recuperamos los 3 documentos más relevantes
+        hits = q.query_points(
+            collection_name=COLLECTION,
+            query=query,
+            query_filter=filt,
+            limit=3
+        ).points
+
+        # 4. Recuperamos el payload de los documentos
+        sources = [h.payload for h in hits]
+
+        # 5. Construimos el contexto para el LLM
+        context = "\n\n---\n\n".join(
+            x["text"] for x in sources
         )
-
-    # 3. Recuperamos los 3 documentos más relevantes
-    hits = q.query_points(
-        collection_name=COLLECTION,
-        query=query,
-        query_filter=filt,
-        limit=3
-    ).points
-
-    # 4. Recuperamos el payload de los documentos
-    sources = [h.payload for h in hits]
-
-    # 5. Construimos el contexto para el LLM
-    context = "\n\n---\n\n".join(
-        x["text"] for x in sources
-    )
 
     # 6. Construimos las instrucciones del sistema
     system = (
@@ -184,13 +269,13 @@ def ask(req: Ask):
     # 11. Registramos evidencia de la petición
     event = {
         "request_id": request_id,
+        "user_id": req.user_id,
         "role": req.role,
         "secure_mode": req.secure_mode,
         "sources": [x["source"] for x in sources],
         "decision": "allow",
         "question": req.question
     }
-
     log_event(event)
 
     # 12. Respondemos al cliente

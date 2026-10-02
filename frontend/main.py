@@ -161,6 +161,7 @@ with col_chat:
                     f"{API}/ask",
                     json={
                         "question": question,
+                        "user_id": user["user_id"],
                         "role": user["role"],
                         "secure_mode": secure
                     },
