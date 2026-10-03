@@ -219,6 +219,7 @@ def transfer(req: TransferRequest):
 
 
 # @freyley.leyva
+# @freyley.leyva
 @app.post("/ask")
 def ask(req: Ask):
     request_id = str(uuid.uuid4())[:8]
@@ -226,10 +227,13 @@ def ask(req: Ask):
     # 1. Convertimos la pregunta en un embedding
     query = embed(req.question)
 
-    # 2. En modo seguro aplicamos control de acceso por rol
-    # 2. En modo seguro aplicamos autorización antes del LLM
+    # 2. Por defecto no existe filtro.
+    # En vulnerable mode esto permite recuperar cualquier
+    # documento relevante de la colección.
     filt = None
 
+    # 3. En Hardened mode aplicamos autorización
+    # ANTES de que los documentos lleguen al LLM.
     if req.secure_mode:
 
         # CUSTOMER:
@@ -258,7 +262,7 @@ def ask(req: Ask):
             )
 
         # SUPPORT / ADMIN:
-        # Conservamos por ahora la política basada en rol.
+        # Conservamos la política basada en rol.
         else:
             filt = Filter(
                 should=[
@@ -268,21 +272,24 @@ def ask(req: Ask):
                     )
                 ]
             )
-        # 3. Recuperamos los 3 documentos más relevantes
-        hits = q.query_points(
-            collection_name=COLLECTION,
-            query=query,
-            query_filter=filt,
-            limit=3
-        ).points
 
-        # 4. Recuperamos el payload de los documentos
-        sources = [h.payload for h in hits]
+    # 4. Recuperamos los 3 documentos más relevantes.
+    # Esta operación ocurre tanto en vulnerable como
+    # en hardened mode.
+    hits = q.query_points(
+        collection_name=COLLECTION,
+        query=query,
+        query_filter=filt,
+        limit=3
+    ).points
 
-        # 5. Construimos el contexto para el LLM
-        context = "\n\n---\n\n".join(
-            x["text"] for x in sources
-        )
+    # 5. Recuperamos el payload de los documentos
+    sources = [h.payload for h in hits]
+
+    # 6. Construimos el contexto para el LLM
+    context = "\n\n---\n\n".join(
+        x["text"] for x in sources
+    )
 
     # 6. Construimos las instrucciones del sistema
     system = (
